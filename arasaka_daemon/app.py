@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, 
                                QTabWidget, QToolButton, QToolTip, QTreeView, QVBoxLayout, QWidget)
 
 from . import languages
+from . import fx
 from .editor import CodeEditor
 from .kit import (FONTS, CutFrame, HudHeader, button, label, load_fonts, logo_pixmap, spaced, stylesheet)
 from .lsp import LspManager, from_uri, to_uri
@@ -1160,6 +1161,8 @@ def main(argv: list[str] | None = None):
     app.setWindowIcon(QIcon(str(ASSETS / "arasaka-daemon.svg")))
     paths = [a for a in argv[1:] if not a.startswith("--")]
     win = MainWindow(paths)
+    # visual Cyberpunk (CRT, glitch, inicialização, barra de status); sem a tela de inicialização nas prévias
+    fx.install(win, name="ARASAKA DAEMON", icon=ASSETS / "arasaka-daemon.svg", boot=not any(a.startswith("--screenshot=") for a in argv))
     win.show()
     app.applicationStateChanged.connect(
         lambda st: st != Qt.ApplicationActive and win.settings["autosave"] and win.save_all(quiet=True))
