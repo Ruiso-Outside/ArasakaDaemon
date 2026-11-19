@@ -3,7 +3,9 @@ ARASAKA DAEMON // cliente LSP (Language Server Protocol).
 
 Um servidor por (linguagem, pasta do projeto), conversando por stdio com
 mensagens JSON-RPC. Suporta: sincronizacao de documentos, diagnosticos,
-autocompletar, hover, ir para definicao e formatacao.
+autocompletar, hover, definicao/implementacao/tipo, referencias, simbolos
+(arquivo e projeto), renomear, code actions (Alt+Enter), inlay hints,
+hierarquia de chamadas e de tipos, formatacao e workspace/applyEdit.
 """
 from __future__ import annotations
 
@@ -59,7 +61,32 @@ def ts_native(cmd: list[str]) -> bool:
         return False
 
 
+def locations(res) -> list[tuple[Path, int, int, int, int]]:
+    """Normaliza Location | Location[] | LocationLink[] em [(arquivo, linha, col, linha_fim, col_fim)]."""
+    if not res:
+        return []
+    out = []
+    for loc in res if isinstance(res, list) else [res]:
+        if not isinstance(loc, dict):
+            continue
+        uri = loc.get("uri") or loc.get("targetUri")
+        rng = loc.get("range") or loc.get("targetSelectionRange") or loc.get("targetRange")
+        if uri and rng:
+            s, e = rng["start"], rng["end"]
+            out.append((from_uri(uri), s["line"], s["character"], e["line"], e["character"]))
+    return out
+
+
+SYMBOL_KIND = {1: "arquivo", 2: "modulo", 3: "namespace", 4: "pacote", 5: "classe", 6: "metodo", 7: "propriedade",
+               8: "campo", 9: "construtor", 10: "enum", 11: "interface", 12: "funcao", 13: "variavel",
+               14: "constante", 15: "texto", 16: "numero", 17: "booleano", 18: "lista", 19: "objeto", 20: "chave",
+               21: "null", 22: "membro", 23: "struct", 24: "evento", 25: "operador", 26: "tipo"}
+SYMBOL_GLYPH = {5: "C", 6: "m", 7: "p", 8: "f", 9: "c", 10: "E", 11: "I", 12: "ƒ", 13: "v", 14: "K", 23: "S",
+                2: "M", 3: "N", 4: "P", 22: "e", 26: "T"}
+
+
 class LspClient(QObject):
+    apply_edit = Signal(dict)              # WorkspaceEdit pedido pelo servidor (workspace/applyEdit)
     diagnostics = Signal(str, list)        # uri, lista
     log = Signal(str)
     state = Signal(str)                    # starting | ready | stopped | error
@@ -106,8 +133,23 @@ class LspClient(QObject):
                     "publishDiagnostics": {"relatedInformation": False},
                     "diagnostic": {"dynamicRegistration": False, "relatedDocumentSupport": False},
                     "signatureHelp": {},
+                    "documentSymbol": {"hierarchicalDocumentSymbolSupport": True},
+                    "references": {},
+                    "implementation": {"linkSupport": True},
+                    "typeDefinition": {"linkSupport": True},
+                    "rename": {"prepareSupport": True},
+                    "codeAction": {"codeActionLiteralSupport": {"codeActionKind": {"valueSet": [
+                        "", "quickfix", "refactor", "refactor.extract", "refactor.inline", "refactor.rewrite",
+                        "source", "source.organizeImports"]}}, "resolveSupport": {"properties": ["edit"]},
+                        "dataSupport": True},
+                    "inlayHint": {},
+                    "callHierarchy": {},
+                    "typeHierarchy": {},
                 },
-                "workspace": {"workspaceFolders": True, "configuration": True},
+                "workspace": {"workspaceFolders": True, "configuration": True, "applyEdit": True,
+                              "workspaceEdit": {"documentChanges": True,
+                                                "resourceOperations": ["create", "rename", "delete"]},
+                              "symbol": {}, "executeCommand": {}},
                 "window": {"workDoneProgress": False},
             },
             "initializationOptions": self._init_options(),
@@ -238,6 +280,9 @@ class LspClient(QObject):
                 result = [None] * len(msg.get("params", {}).get("items", []))
             elif method == "workspace/workspaceFolders":
                 result = [{"uri": to_uri(self.root), "name": self.root.name}]
+            elif method == "workspace/applyEdit":
+                self.apply_edit.emit(msg.get("params", {}).get("edit") or {})
+                result = {"applied": True}
             self._write({"jsonrpc": "2.0", "id": msg["id"], "result": result})
             return
         if method == "textDocument/publishDiagnostics":
@@ -343,12 +388,139 @@ class LspClient(QObject):
                                                  "options": {"tabSize": tab_size, "insertSpaces": spaces}},
                      lambda res: cb(res or []))
 
+    # ------------------------------------------------------------ inteligencia semantica
+    def has(self, cap: str) -> bool:
+        return bool(self.caps.get(cap))
+
+    def locations_request(self, method: str, path, line, col, cb, extra: dict | None = None):
+        """definition / implementation / typeDefinition / references -> lista de locais."""
+        params = self._pos(path, line, col)
+        params.update(extra or {})
+        self.request(method, params, lambda res: cb(locations(res)))
+
+    def references(self, path, line, col, cb):
+        self.locations_request("textDocument/references", path, line, col, cb,
+                               {"context": {"includeDeclaration": True}})
+
+    def document_symbols(self, path, cb):
+        """Arvore de simbolos do arquivo: [{name, kind, detail, line, col, end, children}]."""
+        def conv(items):
+            out = []
+            for s in items or []:
+                if "location" in s:      # SymbolInformation (formato plano)
+                    r = s["location"]["range"]
+                    out.append({"name": s["name"], "kind": s.get("kind", 0), "detail": s.get("containerName", ""),
+                                "line": r["start"]["line"], "col": r["start"]["character"],
+                                "end": r["end"]["line"], "children": []})
+                else:
+                    r = s.get("selectionRange") or s["range"]
+                    out.append({"name": s["name"], "kind": s.get("kind", 0), "detail": s.get("detail", ""),
+                                "line": r["start"]["line"], "col": r["start"]["character"],
+                                "end": s["range"]["end"]["line"], "children": conv(s.get("children"))})
+            return out
+
+        def done(res):
+            syms = conv(res)
+            # SymbolInformation vem plano: aninha pelo intervalo de linhas
+            if res and isinstance(res, list) and res and "location" in res[0]:
+                syms.sort(key=lambda s: s["line"])
+                roots, stack = [], []
+                for s in syms:
+                    while stack and not (stack[-1]["line"] <= s["line"] <= stack[-1]["end"]):
+                        stack.pop()
+                    (stack[-1]["children"] if stack else roots).append(s)
+                    stack.append(s)
+                syms = roots
+            cb(syms)
+        self.request("textDocument/documentSymbol", {"textDocument": {"uri": to_uri(path)}}, done)
+
+    def workspace_symbols(self, query: str, cb):
+        def done(res):
+            out = []
+            for s in res or []:
+                loc = s.get("location") or {}
+                rng = loc.get("range") or {"start": {"line": 0, "character": 0}}
+                if loc.get("uri"):
+                    out.append({"name": s.get("name", ""), "kind": s.get("kind", 0),
+                                "container": s.get("containerName", ""), "path": from_uri(loc["uri"]),
+                                "line": rng["start"]["line"], "col": rng["start"]["character"]})
+            cb(out)
+        self.request("workspace/symbol", {"query": query}, done)
+
+    def prepare_rename(self, path, line, col, cb):
+        if not isinstance(self.caps.get("renameProvider"), dict) or \
+                not self.caps["renameProvider"].get("prepareProvider"):
+            return cb(True)
+        self.request("textDocument/prepareRename", self._pos(path, line, col), lambda res: cb(res))
+
+    def rename(self, path, line, col, new_name: str, cb):
+        params = self._pos(path, line, col)
+        params["newName"] = new_name
+        self.request("textDocument/rename", params, lambda res: cb(res or {}))
+
+    def code_actions(self, path, rng: dict, diags: list, cb, only: list | None = None):
+        ctx = {"diagnostics": diags, "triggerKind": 1}
+        if only:
+            ctx["only"] = only
+        self.request("textDocument/codeAction", {"textDocument": {"uri": to_uri(path)}, "range": rng,
+                                                 "context": ctx}, lambda res: cb(res or []))
+
+    def resolve_code_action(self, action: dict, cb):
+        cap = self.caps.get("codeActionProvider")
+        if isinstance(cap, dict) and cap.get("resolveProvider") and "edit" not in action:
+            self.request("codeAction/resolve", action, lambda res: cb(res or action))
+        else:
+            cb(action)
+
+    def execute_command(self, command: dict, cb=None):
+        self.request("workspace/executeCommand", {"command": command.get("command"),
+                                                  "arguments": command.get("arguments") or []},
+                     cb or (lambda _r: None))
+
+    def inlay_hints(self, path, first: int, last: int, cb):
+        if not self.caps.get("inlayHintProvider"):
+            return cb([])
+
+        def done(res):
+            out = []
+            for h in res or []:
+                lab = h.get("label", "")
+                if isinstance(lab, list):
+                    lab = "".join(p.get("value", "") for p in lab)
+                lab = lab.strip()
+                if lab:
+                    out.append({"line": h["position"]["line"], "col": h["position"]["character"], "label": lab,
+                                "kind": h.get("kind", 0)})
+            cb(out)
+        self.request("textDocument/inlayHint", {"textDocument": {"uri": to_uri(path)}, "range": {
+            "start": {"line": first, "character": 0}, "end": {"line": last, "character": 0}}}, done)
+
+    def prepare_call_hierarchy(self, path, line, col, cb, kind: str = "call"):
+        method = "textDocument/prepareCallHierarchy" if kind == "call" else "textDocument/prepareTypeHierarchy"
+        self.request(method, self._pos(path, line, col), lambda res: cb(res or []))
+
+    def hierarchy_step(self, item: dict, method: str, cb):
+        """method: callHierarchy/incomingCalls | outgoingCalls | typeHierarchy/supertypes | subtypes.
+        Retorna [(item, [ranges das chamadas])]."""
+        def done(res):
+            out = []
+            for r in res or []:
+                if "from" in r:
+                    out.append((r["from"], r.get("fromRanges", [])))
+                elif "to" in r:
+                    out.append((r["to"], r.get("fromRanges", [])))
+                else:
+                    out.append((r, []))
+            cb(out)
+        self.request(method, {"item": item}, done)
+
 
 class LspManager(QObject):
     """Cria/reaproveita clientes por linguagem + raiz do projeto."""
     diagnostics = Signal(str, list)
     log = Signal(str)
     status = Signal(str, str)              # languageId, estado
+    apply_edit = Signal(dict)
 
     def __init__(self):
         super().__init__()
@@ -378,6 +550,7 @@ class LspManager(QObject):
             return None
         c = LspClient(lang, cmd, root, server.name or cmd[0])
         c.diagnostics.connect(self.diagnostics.emit)
+        c.apply_edit.connect(self.apply_edit.emit)
         c.log.connect(self.log.emit)
         c.state.connect(lambda st, lid=lang.id: self.status.emit(lid, st))
         self.clients[key] = c

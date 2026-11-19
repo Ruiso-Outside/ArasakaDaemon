@@ -234,7 +234,7 @@ class OutputPanel(QPlainTextEdit):
     def running(self) -> bool:
         return bool(self.proc and self.proc.state() != QProcess.NotRunning)
 
-    def run(self, argv: list[str], cwd: Path, title: str):
+    def run(self, argv: list[str], cwd: Path, title: str, env_extra: dict | None = None):
         import time
         self.stop()
         self.clear()
@@ -246,6 +246,8 @@ class OutputPanel(QPlainTextEdit):
         env = QProcessEnvironment.systemEnvironment()
         env.insert("PYTHONUNBUFFERED", "1")
         env.insert("PYTHONIOENCODING", "utf-8")
+        for k, v in (env_extra or {}).items():
+            env.insert(k, v)
         self.proc.setProcessEnvironment(env)
         self.proc.readyReadStandardOutput.connect(
             lambda: self.append_color(self._dec(self.proc.readAllStandardOutput())))

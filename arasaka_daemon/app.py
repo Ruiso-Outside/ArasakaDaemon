@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -17,9 +18,11 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, 
                                QMenu, QMessageBox, QPushButton, QScrollArea, QSpinBox, QSplitter, QStackedWidget,
                                QTabWidget, QToolButton, QToolTip, QTreeView, QVBoxLayout, QWidget)
 
-from . import languages
+from . import analysis, languages
 from . import fx
 from .editor import CodeEditor
+from .ide import IntelMixin
+from .intel import DebugPanel, LocationsPanel, ProfilerPanel, StructurePanel
 from .kit import (FONTS, CutFrame, HudHeader, button, label, load_fonts, logo_pixmap, spaced, stylesheet)
 from .lsp import LspManager, from_uri, to_uri
 from .panels import (FindBar, IconProvider, OutputPanel, Picker, ProblemsPanel, SearchPanel, Terminal, lang_icon,
@@ -27,7 +30,7 @@ from .panels import (FindBar, IconProvider, OutputPanel, Picker, ProblemsPanel, 
 
 APP_ID = "arasaka-daemon"
 APP_NAME = "ARASAKA DAEMON"
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 ASSETS = Path(__file__).resolve().parent / "assets"
 
 
@@ -41,7 +44,8 @@ def config_dir() -> Path:
 
 DEFAULTS = {"font_size": 13, "tab_size": 4, "auto_close": True, "autocomplete": True, "trim_whitespace": True,
             "final_newline": True, "autosave": False, "lsp": True, "run_overrides": {}, "recent": [],
-            "session": {}}
+            "session": {}, "inlay_hints": True, "usage_counts": True, "flow_analysis": True, "git_gutter": True,
+            "templates": {}}
 
 EXTRA_QSS = """
 QMenuBar { background: #030304; border-bottom: 1px solid #1a0507; padding: 2px 6px; }
@@ -69,6 +73,14 @@ QStatusBar QLabel { color: #ffffff; padding: 0 10px; font-weight: 700; }
 QStatusBar::item { border: none; }
 QSpinBox { background: #050506; border: 1px solid #2a2a31; padding: 6px 8px; }
 QPushButton::menu-indicator { image: none; width: 0; }
+QHeaderView { background: #050506; border: none; }
+QHeaderView::section { background: #070708; color: #8c8c96; border: none; border-right: 1px solid #16161a;
+  border-bottom: 1px solid #2a0a0d; padding: 4px 8px; font-weight: 700; }
+QTableWidget, QTableView { background: #050506; gridline-color: #16161a; border: 1px solid #16161a; }
+QTableCornerButton::section { background: #070708; border: none; }
+QListWidget { background: #050506; border: none; outline: none; }
+QListWidget::item { padding: 4px 6px; }
+QListWidget::item:selected { background: rgba(227,18,31,0.28); color: #ffffff; }
 """
 
 
@@ -148,11 +160,15 @@ class WelcomePage(QScrollArea):
         kl = QGridLayout(keys)
         kl.setContentsMargins(20, 16, 20, 16)
         kl.addWidget(label("ATALHOS", "section", 3), 0, 0, 1, 2)
-        shortcuts = [("Ctrl+P", "abrir arquivo do projeto"), ("Ctrl+Shift+P", "paleta de comandos"),
-                     ("F5", "executar arquivo atual"), ("Ctrl+Espaco", "autocompletar"),
-                     ("F12 / Ctrl+clique", "ir para definicao"), ("Shift+Alt+F", "formatar documento"),
-                     ("Ctrl+/", "comentar linhas"), ("Ctrl+D", "duplicar linha"), ("Alt+Cima/Baixo", "mover linha"),
-                     ("Ctrl+F / Ctrl+H", "buscar / substituir"), ("Ctrl+Shift+F", "buscar nos arquivos"),
+        shortcuts = [("Shift Shift", "Search Everywhere"), ("Alt+Enter", "acoes de contexto / intencoes"),
+                     ("Ctrl+P", "abrir arquivo do projeto"), ("Ctrl+Shift+P", "paleta de comandos"),
+                     ("F5 / Shift+F9", "executar / depurar"), ("Ctrl+Espaco", "autocompletar"),
+                     ("F12 / Ctrl+clique", "ir para definicao"), ("Shift+F12", "encontrar usos"),
+                     ("Ctrl+Alt+H", "hierarquia de chamadas"), ("F2", "renomear simbolo"),
+                     ("Ctrl+Alt+M / V / C", "extrair metodo / variavel / constante"),
+                     ("Ctrl+F6", "alterar assinatura"), ("Ctrl+F12", "estrutura do arquivo"),
+                     ("Ctrl+Shift+T", "ir para o teste"), ("Alt+Shift+H", "historico local"),
+                     ("Alt+Esq / Dir", "voltar / avancar"), ("Tab", "expandir live template"),
                      ("Ctrl+`", "terminal")]
         for i, (k, d) in enumerate(shortcuts, 1):
             kk = label(k, "red", 1, 13, True)
@@ -285,7 +301,11 @@ class SettingsPage(QScrollArea):
                           ("trim_whitespace", "Remover espacos no fim das linhas ao salvar"),
                           ("final_newline", "Garantir linha em branco no fim do arquivo"),
                           ("autosave", "Salvar automaticamente ao trocar de aba / janela"),
-                          ("lsp", "Ativar servidores de linguagem (LSP)")]:
+                          ("lsp", "Ativar servidores de linguagem (LSP)"),
+                          ("inlay_hints", "Inlay hints: tipos inferidos e nomes de parametros no meio da linha"),
+                          ("usage_counts", "Contadores de uso ao lado de funcoes e classes"),
+                          ("flow_analysis", "Analise de fluxo de dados propria (Python): None, codigo morto, recursos"),
+                          ("git_gutter", "Marcadores do git e blame na lateral")]:
             cb = QCheckBox(text)
             cb.setChecked(bool(s[key]))
             cb.toggled.connect(lambda v, k=key: self._set(k, v))
@@ -330,7 +350,7 @@ class SettingsPage(QScrollArea):
 
 
 # ================================================================ janela principal
-class MainWindow(QMainWindow):
+class MainWindow(IntelMixin, QMainWindow):
     def __init__(self, open_paths: list[str]):
         super().__init__()
         self.settings = Settings()
@@ -364,12 +384,14 @@ class MainWindow(QMainWindow):
         al.addSpacing(10)
         self.act_btns = {}
         for key, glyph, tip in [("explorer", "▤", "Explorador (Ctrl+Shift+E)"), ("search", "⌕", "Buscar (Ctrl+Shift+F)"),
-                                ("langs", "{ }", "Linguagens"), ("run", "▶", "Executar (F5)")]:
+                                ("structure", "≣", "Estrutura do arquivo (Ctrl+F12)"),
+                                ("langs", "{ }", "Linguagens"), ("run", "▶", "Executar (F5)"),
+                                ("debug", "⊛", "Depurar (Shift+F9)")]:
             b = QToolButton()
             b.setObjectName("act")
             b.setText(glyph)
             b.setToolTip(tip)
-            b.setCheckable(key in ("explorer", "search"))
+            b.setCheckable(key in ("explorer", "search", "structure"))
             b.setFixedSize(52, 48)
             b.setCursor(Qt.PointingHandCursor)
             b.clicked.connect(lambda _=False, k=key: self.activity(k))
@@ -433,6 +455,9 @@ class MainWindow(QMainWindow):
         self.search = SearchPanel()
         self.search.open_location.connect(self.open_location)
         self.side.addWidget(self.search)
+        self.structure = StructurePanel()
+        self.structure.open_location.connect(self.open_location)
+        self.side.addWidget(self.structure)
         self.hsplit.addWidget(self.side)
 
         # editor + painel inferior
@@ -475,10 +500,22 @@ class MainWindow(QMainWindow):
         self.problems = ProblemsPanel()
         self.problems.open_location.connect(self.open_location)
         self.lsplog = OutputPanel()
+        self.refs = LocationsPanel()
+        self.refs.open_location.connect(self.open_location)
+        self.debug_panel = DebugPanel()
+        self.debug_panel.command.connect(self.debug_cmd)
+        self.debug_panel.open_location.connect(lambda p, l, c: self.open_file(Path(p), l, c))
+        self.debug_panel.watches_changed.connect(
+            lambda ws: self.debug and self.debug.send({"cmd": "watches", "list": ws}))
+        self.profiler = ProfilerPanel()
+        self.profiler.open_location.connect(self.open_location)
         self.bottom.addTab(self.terminal, "TERMINAL")
         self.bottom.addTab(out_wrap, "SAIDA")
         self.bottom.addTab(self.problems, "PROBLEMAS")
         self.bottom.addTab(self.lsplog, "LSP")
+        self.bottom.addTab(self.refs, "REFERENCIAS")
+        self.bottom.addTab(self.debug_panel, "DEPURAR")
+        self.bottom.addTab(self.profiler, "PROFILER")
         self.vsplit.addWidget(self.bottom)
         self.vsplit.setStretchFactor(0, 4)
         self.vsplit.setStretchFactor(1, 1)
@@ -513,6 +550,7 @@ class MainWindow(QMainWindow):
         self.lsp.log.connect(lambda t: self.lsplog.append_color(t + "\n", "#8c8c96"))
         self.lsp.status.connect(self.on_lsp_status)
 
+        self.setup_intel()
         self.build_menus()
         self.welcome = WelcomePage(self)
         self.tabs.addTab(self.welcome, QIcon(logo_pixmap(16)), "BEM-VINDO")
@@ -556,6 +594,7 @@ class MainWindow(QMainWindow):
         add(m, "Ir para linha...", self.goto_line, "Ctrl+G")
         add(m, "Ir para definicao", self.goto_definition, "F12")
         add(m, "Formatar documento", self.format_document, "Shift+Alt+F")
+        self.intel_menus(add, mb)
         m = mb.addMenu("VER")
         add(m, "Paleta de comandos", self.command_palette, "Ctrl+Shift+P")
         add(m, "Abrir arquivo do projeto", self.quick_open, "Ctrl+P")
@@ -569,10 +608,12 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         add(m, "Linguagens", self.show_languages)
         add(m, "Configuracoes", self.show_settings, "Ctrl+,")
+        self.intel_view_menu(add, m)
         m = mb.addMenu("EXECUTAR")
         add(m, "Executar arquivo", self.run_current, "F5")
         add(m, "Executar no terminal", lambda: self.run_current(in_terminal=True), "Ctrl+F5")
         add(m, "Parar", self.output.stop, "Shift+F5")
+        self.intel_run_menu(add, m)
         m.addSeparator()
         add(m, "Reiniciar servidores de linguagem", self.restart_lsp)
         m = mb.addMenu("AJUDA")
@@ -603,7 +644,9 @@ class MainWindow(QMainWindow):
             return self.show_languages()
         if key == "run":
             return self.run_current()
-        idx = {"explorer": 0, "search": 1}[key]
+        if key == "debug":
+            return self.start_debug()
+        idx = {"explorer": 0, "search": 1, "structure": 2}[key]
         visible = self.side.isVisible() and self.side.currentIndex() == idx
         if visible and not force:
             self.side.hide()
@@ -611,8 +654,11 @@ class MainWindow(QMainWindow):
             return
         self.side.show()
         self.side.setCurrentIndex(idx)
-        for k in ("explorer", "search"):
+        for k in ("explorer", "search", "structure"):
             self.act_btns[k].setChecked(k == key)
+        if key == "structure":
+            self.schedule_intel()
+            self.structure.q.setFocus()
         if key == "search":
             ed = self.editor()
             if ed and ed.textCursor().hasSelection():
@@ -687,6 +733,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{path.name} — {APP_NAME}")
         self.st_branch.setText(("⎇ " + git_branch(path)) if git_branch(path) else "")
         self.welcome.refresh()
+        self.build_index()
 
     def close_folder(self):
         self.root = None
@@ -746,6 +793,9 @@ class MainWindow(QMainWindow):
         m.addAction("Nova pasta", lambda: self.new_in_tree(True))
         m.addSeparator()
         m.addAction("Renomear", lambda: self.rename(p))
+        if p.is_file():
+            m.addAction("Exclusao segura (procura referencias)...", lambda: self.safe_delete_file(p))
+            m.addAction("Historico local", lambda: (self.open_file(p), self.file_history()))
         m.addAction("Excluir (lixeira)", lambda: self.delete_path(p))
         m.addSeparator()
         m.addAction("Copiar caminho", lambda: QApplication.clipboard().setText(str(p)))
@@ -772,9 +822,7 @@ class MainWindow(QMainWindow):
     def delete_path(self, p: Path):
         if QMessageBox.question(self, "Excluir", f"Mover para a lixeira?\n{p}") != QMessageBox.Yes:
             return
-        from PySide6.QtCore import QFile
-        if not QFile.moveToTrash(str(p)):
-            QMessageBox.warning(self, "Erro", "Nao foi possivel mover para a lixeira.")
+        self._trash(p)
 
     # ------------------------------------------------------------ arquivos
     def open_file_dialog(self):
@@ -827,6 +875,7 @@ class MainWindow(QMainWindow):
         ed.completion_requested.connect(lambda ln, col, trig, e=ed: self.complete(e, ln, col, trig))
         ed.hover_requested.connect(lambda ln, col, gp, e=ed: self.hover(e, ln, col, gp))
         ed.definition_requested.connect(lambda ln, col, e=ed: self.definition(e, ln, col))
+        self.intel_attach(ed)
         ed.setFocus()
         self.update_status()
 
@@ -842,6 +891,8 @@ class MainWindow(QMainWindow):
             self.save_all(quiet=True)
         self.findbar.update_hits()
         self.update_status()
+        if hasattr(self, "history"):
+            self.schedule_intel()
 
     def save_editor(self, ed: CodeEditor, as_new=False) -> bool:
         if ed.path is None or as_new:
@@ -863,6 +914,10 @@ class MainWindow(QMainWindow):
         c = self.lsp_client(ed)
         if c:
             c.did_save(ed.path, ed.toPlainText())
+        self.snapshot(ed, "salvo")
+        self.reindex_file(ed.path, ed.toPlainText())
+        self.refresh_git(ed)
+        self.schedule_intel(ed)
         self.toast(f"salvo: {ed.path}")
         return True
 
@@ -892,6 +947,9 @@ class MainWindow(QMainWindow):
             if w.path:
                 self.watcher.removePath(str(w.path))
                 self.problems.set_file(str(w.path), [])
+                self.local_diags.pop(str(w.path), None)
+            if w is self.debug_editor:
+                self.debug_editor = None
         self.tabs.removeTab(i)
         if isinstance(w, CodeEditor):
             w.deleteLater()
@@ -904,6 +962,7 @@ class MainWindow(QMainWindow):
                 if not Path(path).exists():
                     return
                 if not ed.document().isModified():
+                    self.snapshot(ed, "antes de recarregar do disco")
                     ed.reload()
                     self.lsp_change(ed)
                     self.toast(f"recarregado: {ed.path.name}")
@@ -913,7 +972,7 @@ class MainWindow(QMainWindow):
             self.watcher.addPath(path)
 
     def open_location(self, path: str, line: int, col: int):
-        self.open_file(Path(path), line, col)
+        self.jump(path, line, col)
 
     def goto_line(self):
         ed = self.editor()
@@ -1008,11 +1067,15 @@ class MainWindow(QMainWindow):
         self.update_status()
 
     def on_diagnostics(self, uri: str, diags: list):
-        path = from_uri(uri)
-        self.problems.set_file(str(path), diags)
+        path = from_uri(uri).resolve()
+        self.lsp_diags[str(path)] = diags
+        matched = False
         for ed in self.editors():
-            if ed.path and ed.path.resolve() == path.resolve():
-                ed.set_diagnostics(diags)
+            if ed.path and ed.path.resolve() == path:
+                self.merge_diagnostics(ed)
+                matched = True
+        if not matched:
+            self.problems.set_file(str(path), diags)
         e, w = self.problems.counts()
         self.st_problems.setText(f"■ {e}  ▲ {w}")
 
@@ -1047,7 +1110,7 @@ class MainWindow(QMainWindow):
 
         def done(loc):
             if loc:
-                self.open_file(loc[0], loc[1], loc[2])
+                self.jump(loc[0], loc[1], loc[2])
             else:
                 self.toast("Definicao nao encontrada")
         c.definition(ed.path, ln, col, done)
@@ -1081,10 +1144,16 @@ class MainWindow(QMainWindow):
         ed = self.editor()
         if not ed:
             return self.toast("Abra um arquivo para executar")
+        if ed.lang.id == "http":
+            return self.run_http(ed)
         if ed.document().isModified() or ed.path is None:
             if not self.save_editor(ed):
                 return
+        self.snapshot(ed, "executado")
         tmpl = self.settings["run_overrides"].get(ed.lang.id) or ed.lang.run_command()
+        venv = analysis.python_project_venv(self.root) if ed.lang.id == "python" else None
+        if venv and not self.settings["run_overrides"].get("python"):
+            tmpl = re.sub(r"^\S+", lambda _m: f'"{venv}"', tmpl, count=1)
         if not tmpl:
             return self.toast(f"Sem comando de execucao para {ed.lang.name} (configure em CONFIGURACOES)")
         f = ed.path
@@ -1141,6 +1210,7 @@ class MainWindow(QMainWindow):
                                     "files": [str(ed.path) for ed in self.editors() if ed.path],
                                     "current": str(cur.path) if cur and cur.path else ""}
         self.settings.save()
+        self.stop_debug()
         self.lsp.stop_all()
         self.terminal.shutdown()
         self.output.stop()

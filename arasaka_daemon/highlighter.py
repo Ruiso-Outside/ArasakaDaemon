@@ -88,87 +88,145 @@ def _words(s: str, ci: bool) -> re.Pattern | None:
                       rf"(?<![\w$#@])(?:{alt})(?!\w)", re.I if ci else 0)
 
 
+def build_rules(lang: Language) -> list[tuple[re.Pattern, str, int]]:
+    rules: list[tuple[re.Pattern, str, int]] = []
+    L = lang
+    ci = L.case_insensitive
+    if L.id == "markdown":
+        rules = [
+            (re.compile(r"^\s{0,3}#{1,6}\s.*$"), "heading", 0),
+            (re.compile(r"\*\*[^*]+\*\*|__[^_]+__"), "bold", 0),
+            (re.compile(r"(?<![*\w])\*[^*\s][^*]*\*(?!\*)|(?<![_\w])_[^_\s][^_]*_(?!_)"), "italic", 0),
+            (re.compile(r"`[^`]+`"), "code", 0),
+            (re.compile(r"!?\[[^\]]*\]\([^)]*\)"), "link", 0),
+            (re.compile(r"^\s*(?:[-*+]|\d+\.)\s"), "keyword", 0),
+            (re.compile(r"^\s*>.*$"), "comment", 0),
+        ]
+        return rules
+    if L.markup:
+        rules = [
+            (re.compile(r"</?[\w:.-]+|/?>"), "tag", 0),
+            (re.compile(r"\s([\w:@.#-]+)(?==)"), "attr", 1),
+            (re.compile(r"&[#\w]+;"), "escape", 0),
+            (re.compile(r"<!DOCTYPE[^>]*>|<\?[^?]*\?>", re.I), "preproc", 0),
+        ]
+        return rules
+    num = re.compile(r"(?<![\w.])(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+|"
+                     r"\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d+)?)[a-zA-Z]{0,3}(?!\w)")
+    if L.id in ("css",):
+        rules += [(re.compile(r"#[0-9a-fA-F]{3,8}\b"), "number", 0),
+                       (re.compile(r"(?<![\w-])-?\d+(?:\.\d+)?(?:px|em|rem|%|vh|vw|s|ms|deg|fr)?"), "number", 0),
+                       (re.compile(r"([\w-]+)(?=\s*:[^:])"), "key", 1),
+                       (re.compile(r"[.#][\w-]+|::?[\w-]+"), "function", 0),
+                       (re.compile(r"@[\w-]+"), "keyword", 0)]
+    elif L.id == "json":
+        rules += [(num, "number", 0), (re.compile(r'"(?:[^"\\]|\\.)*"(?=\s*:)'), "key", 0)]
+    elif L.id == "yaml":
+        rules += [(num, "number", 0), (re.compile(r"^(\s*-?\s*)([\w./-]+)(?=\s*:)"), "key", 2),
+                       (re.compile(r"^\s*-\s"), "operator", 0), (re.compile(r"[&*][\w-]+"), "variable", 0),
+                       (re.compile(r"^---$|^\.\.\.$"), "keyword", 0)]
+    elif L.id == "toml":
+        rules += [(num, "number", 0), (re.compile(r"^\s*\[\[?[^\]]+\]\]?"), "heading", 0),
+                       (re.compile(r"^\s*([\w.\"-]+)(?=\s*=)"), "key", 1)]
+    else:
+        rules += [(num, "number", 0),
+                       (re.compile(r"\b([A-Za-z_]\w*)(?=\s*\()"), "function", 1)]
+        if L.id not in ("sql", "bat", "shellscript", "powershell", "makefile", "dockerfile"):
+            rules.append((re.compile(r"\b[A-Z][A-Z0-9_]{2,}\b"), "constant", 0))
+        if L.id in ("java", "csharp", "kotlin", "swift", "dart", "typescript", "cpp", "rust", "go", "php"):
+            rules.append((re.compile(r"\b[A-Z][a-z0-9]\w*\b"), "type", 0))
+    for words, kind in ((L.builtins, "builtin"), (L.types, "type"), (L.constants, "constant"),
+                        (L.keywords, "keyword")):
+        pat = _words(words, ci)
+        if pat:
+            rules.append((pat, kind, 0))
+    if L.decorators:
+        rules.append((re.compile(r"@[\w.]+"), "decorator", 0))
+    if L.preprocessor:
+        rules.append((re.compile(r"^\s*#\s*\w+"), "preproc", 0))
+    if L.variables == "$":
+        rules.append((re.compile(r"\$\{?[\w@#?*!-]+\}?"), "variable", 0))
+    elif L.variables == "%":
+        rules.append((re.compile(r"%[\w~]+%?|%%\w"), "variable", 0))
+    if L.id == "rust":
+        rules.append((re.compile(r"\b\w+!"), "decorator", 0))
+        rules.append((re.compile(r"'[a-z_]\w*\b(?!')"), "decorator", 0))
+    return rules
+
+
+# ---------------------------------------------------------------- injecao de linguagem em strings
+# SQL, JSON, HTML e regex escritos dentro de strings ganham o realce da linguagem de dentro.
+_INJ_SQL = re.compile(r"^\s*(SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM|CREATE\s+(TABLE|INDEX|VIEW)|DROP|ALTER|WITH)\b",
+                      re.I)
+_INJ_HTML = re.compile(r"^\s*<(!DOCTYPE|[a-zA-Z][\w-]*)[^>]*>")
+_INJ_JSON = re.compile(r'^\s*[\[{]\s*("|\]|}|$)')
+_INJ_REGEX_CALL = re.compile(r"(re\.\w+|RegExp|Pattern\.compile|Regex|regexp\.\w+|preg_\w+)\s*\(\s*[rbuf]*$")
+_REGEX_RULES = [(re.compile(r"\\[dDwWsSbBnrtfv]|\\."), "escape", 0),
+                (re.compile(r"\[\^?(?:\\.|[^\]])*\]"), "type", 0),
+                (re.compile(r"\(\?(?:[:=!]|<[=!]|P?<\w+>)|[()|]"), "keyword", 0),
+                (re.compile(r"[*+?]\??|\{\d+(,\d*)?\}\??"), "operator", 0),
+                (re.compile(r"[\^$.]"), "builtin", 0)]
+_INJ_CACHE: dict[str, list] = {}
+
+
+def injected_rules(lang_id: str) -> list:
+    if lang_id == "regex":
+        return _REGEX_RULES
+    if lang_id not in _INJ_CACHE:
+        from .languages import BY_ID
+        lg = BY_ID.get(lang_id)
+        _INJ_CACHE[lang_id] = build_rules(lg) if lg else []
+    return _INJ_CACHE[lang_id]
+
+
+def detect_injection(before: str, content: str, prefix: str) -> str:
+    if "r" in prefix.lower() and not content.startswith("<"):
+        return "regex"
+    if _INJ_REGEX_CALL.search(before):
+        return "regex"
+    if _INJ_SQL.match(content):
+        return "sql"
+    if _INJ_HTML.match(content):
+        return "html"
+    if _INJ_JSON.match(content) and ":" in content or content.strip() in ("{}", "[]"):
+        return "json"
+    return ""
+
+
 class Highlighter(QSyntaxHighlighter):
     def __init__(self, doc, lang: Language):
         super().__init__(doc)
         self.lang = lang
         self.enabled = doc.characterCount() < MAX_HIGHLIGHT_CHARS
-        self.rules: list[tuple[re.Pattern, str, int]] = []
-        L = lang
-        ci = L.case_insensitive
-        if L.id == "markdown":
-            self.rules = [
-                (re.compile(r"^\s{0,3}#{1,6}\s.*$"), "heading", 0),
-                (re.compile(r"\*\*[^*]+\*\*|__[^_]+__"), "bold", 0),
-                (re.compile(r"(?<![*\w])\*[^*\s][^*]*\*(?!\*)|(?<![_\w])_[^_\s][^_]*_(?!_)"), "italic", 0),
-                (re.compile(r"`[^`]+`"), "code", 0),
-                (re.compile(r"!?\[[^\]]*\]\([^)]*\)"), "link", 0),
-                (re.compile(r"^\s*(?:[-*+]|\d+\.)\s"), "keyword", 0),
-                (re.compile(r"^\s*>.*$"), "comment", 0),
-            ]
-            return
-        if L.markup:
-            self.rules = [
-                (re.compile(r"</?[\w:.-]+|/?>"), "tag", 0),
-                (re.compile(r"\s([\w:@.#-]+)(?==)"), "attr", 1),
-                (re.compile(r"&[#\w]+;"), "escape", 0),
-                (re.compile(r"<!DOCTYPE[^>]*>|<\?[^?]*\?>", re.I), "preproc", 0),
-            ]
-            return
-        num = re.compile(r"(?<![\w.])(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+|"
-                         r"\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d+)?)[a-zA-Z]{0,3}(?!\w)")
-        if L.id in ("css",):
-            self.rules += [(re.compile(r"#[0-9a-fA-F]{3,8}\b"), "number", 0),
-                           (re.compile(r"(?<![\w-])-?\d+(?:\.\d+)?(?:px|em|rem|%|vh|vw|s|ms|deg|fr)?"), "number", 0),
-                           (re.compile(r"([\w-]+)(?=\s*:[^:])"), "key", 1),
-                           (re.compile(r"[.#][\w-]+|::?[\w-]+"), "function", 0),
-                           (re.compile(r"@[\w-]+"), "keyword", 0)]
-        elif L.id == "json":
-            self.rules += [(num, "number", 0), (re.compile(r'"(?:[^"\\]|\\.)*"(?=\s*:)'), "key", 0)]
-        elif L.id == "yaml":
-            self.rules += [(num, "number", 0), (re.compile(r"^(\s*-?\s*)([\w./-]+)(?=\s*:)"), "key", 2),
-                           (re.compile(r"^\s*-\s"), "operator", 0), (re.compile(r"[&*][\w-]+"), "variable", 0),
-                           (re.compile(r"^---$|^\.\.\.$"), "keyword", 0)]
-        elif L.id == "toml":
-            self.rules += [(num, "number", 0), (re.compile(r"^\s*\[\[?[^\]]+\]\]?"), "heading", 0),
-                           (re.compile(r"^\s*([\w.\"-]+)(?=\s*=)"), "key", 1)]
-        else:
-            self.rules += [(num, "number", 0),
-                           (re.compile(r"\b([A-Za-z_]\w*)(?=\s*\()"), "function", 1)]
-            if L.id not in ("sql", "bat", "shellscript", "powershell", "makefile", "dockerfile"):
-                self.rules.append((re.compile(r"\b[A-Z][A-Z0-9_]{2,}\b"), "constant", 0))
-            if L.id in ("java", "csharp", "kotlin", "swift", "dart", "typescript", "cpp", "rust", "go", "php"):
-                self.rules.append((re.compile(r"\b[A-Z][a-z0-9]\w*\b"), "type", 0))
-        for words, kind in ((L.builtins, "builtin"), (L.types, "type"), (L.constants, "constant"),
-                            (L.keywords, "keyword")):
-            pat = _words(words, ci)
-            if pat:
-                self.rules.append((pat, kind, 0))
-        if L.decorators:
-            self.rules.append((re.compile(r"@[\w.]+"), "decorator", 0))
-        if L.preprocessor:
-            self.rules.append((re.compile(r"^\s*#\s*\w+"), "preproc", 0))
-        if L.variables == "$":
-            self.rules.append((re.compile(r"\$\{?[\w@#?*!-]+\}?"), "variable", 0))
-        elif L.variables == "%":
-            self.rules.append((re.compile(r"%[\w~]+%?|%%\w"), "variable", 0))
-        if L.id == "rust":
-            self.rules.append((re.compile(r"\b\w+!"), "decorator", 0))
-            self.rules.append((re.compile(r"'[a-z_]\w*\b(?!')"), "decorator", 0))
+        self.rules = build_rules(lang)
+        self.hints: dict[int, tuple[str, list[tuple[int, float]]]] = {}   # linha -> (texto, [(coluna, largura)])
+        self.inject = lang.id not in ("sql", "json", "html", "xml", "markdown", "plaintext")
 
     # ------------------------------------------------------------------
     def highlightBlock(self, text: str):
-        if not self.enabled:
+        if self.enabled:
+            for pat, kind, group in self.rules:
+                for m in pat.finditer(text):
+                    s, e = m.span(group)
+                    if e > s:
+                        self.setFormat(s, e - s, F[kind])
+            if self.lang.id == "markdown":
+                self._markdown_fence(text)
+            else:
+                self._scan(text)
+        self._gaps(text)
+
+    def _gaps(self, text: str):
+        """Abre espaco visual (sem mudar o texto) para os inlay hints: espacamento extra no caractere anterior."""
+        h = self.hints.get(self.currentBlock().blockNumber())
+        if not h or h[0] != text:
             return
-        for pat, kind, group in self.rules:
-            for m in pat.finditer(text):
-                s, e = m.span(group)
-                if e > s:
-                    self.setFormat(s, e - s, F[kind])
-        if self.lang.id == "markdown":
-            self._markdown_fence(text)
-            return
-        self._scan(text)
+        for col, width in h[1]:
+            if 0 < col <= len(text):
+                f = QTextCharFormat(self.format(col - 1))
+                f.setFontLetterSpacingType(QFont.AbsoluteSpacing)
+                f.setFontLetterSpacing(width)
+                self.setFormat(col - 1, 1, f)
 
     def _markdown_fence(self, text: str):
         prev = self.previousBlockState()
@@ -253,12 +311,30 @@ class Highlighter(QSyntaxHighlighter):
                     self.setFormat(i, n - i, F["string"])
                     break
                 self.setFormat(i, j + 1 - i, F["string"])
-                for m in re.finditer(r"\\.", text[i:j + 1]):
-                    self.setFormat(i + m.start(), 2, F["escape"])
+                inj = detect_injection(text[:i], text[i + 1:j], text[max(0, i - 2):i]) if self.inject else ""
+                if inj:
+                    self._inject(text, i + 1, j, inj)
+                else:
+                    for m in re.finditer(r"\\.", text[i:j + 1]):
+                        self.setFormat(i + m.start(), 2, F["escape"])
                 i = j + 1
                 continue
             i += 1
         self.setCurrentBlockState(NORMAL)
+
+    def _inject(self, text: str, start: int, end: int, lang_id: str):
+        """Realca text[start:end] (conteudo da string) com as regras de outra linguagem."""
+        seg = text[start:end]
+        base = QTextCharFormat(F["string"])
+        base.setBackground(QColor(255, 255, 255, 8))
+        self.setFormat(start, end - start, base)
+        for pat, kind, group in injected_rules(lang_id):
+            for m in pat.finditer(seg):
+                s, e = m.span(group)
+                if e > s:
+                    f = QTextCharFormat(F[kind])
+                    f.setBackground(QColor(255, 255, 255, 8))
+                    self.setFormat(start + s, e - s, f)
 
     @staticmethod
     def _find_end(text: str, start: int, tok: str, escapes: bool) -> int:

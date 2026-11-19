@@ -275,6 +275,8 @@ LANGS: list[Language] = [
              "", "", "", "true false", "#", (), "\"'"),
     Language("markdown", "Markdown", (".md", ".markdown", ".mdx"), "#083fa1", "MD", line_comment="",
              quotes="", constants=""),
+    Language("http", "HTTP", (".http", ".rest"), "#e3121f", "API",
+             "GET POST PUT PATCH DELETE HEAD OPTIONS HTTP", "", "", "", "#", (), "\"", variables="$"),
     Language("makefile", "Makefile", (".mk", ".mak"), "#427819", "MK",
              "ifeq ifneq ifdef ifndef else endif include define endef export", "", "", "", "#", (), "\"'",
              variables="$", run='make -C "{dir}"', runtime=["make"], filenames=("Makefile", "makefile", "GNUmakefile")),

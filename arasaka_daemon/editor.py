@@ -5,20 +5,33 @@ QPlainTextEdit com numeros de linha, marcadores de erro, linha atual,
 pares de colchetes, indentacao automatica, fechamento de pares, comentar
 linhas, mover/duplicar linhas, autocompletar (LSP ou palavras do arquivo)
 e eventos para hover / ir para definicao.
+
+Inteligencia visual: inlay hints no meio da linha (sem alterar o texto),
+contadores de uso e valores do depurador no fim da linha, marcadores do git
+e blame na lateral, breakpoints (com condicao e logpoint), live templates com
+campos navegaveis por Tab e realce de blocos de conflito de merge.
 """
 from __future__ import annotations
 
 import re
 from pathlib import Path
 
-from PySide6.QtCore import QRect, QSize, QStringListModel, Qt, QTimer, Signal
-from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QKeySequence, QPainter, QStandardItem, QStandardItemModel,
-                           QTextCharFormat, QTextCursor, QTextDocument, QTextFormat)
-from PySide6.QtWidgets import QCompleter, QPlainTextEdit, QTextEdit, QToolTip, QWidget
+import time
+
+from PySide6.QtCore import QPointF, QRect, QRectF, QSize, QStringListModel, Qt, QTimer, Signal
+from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QKeySequence, QPainter, QPolygonF, QStandardItem,
+                           QStandardItemModel, QTextCharFormat, QTextCursor, QTextDocument, QTextFormat)
+from PySide6.QtWidgets import QApplication, QCompleter, QMenu, QPlainTextEdit, QTextEdit, QToolTip, QWidget
 
 from . import languages
+from . import templates as tpl
 from .highlighter import Highlighter
 from .kit import FONTS
+
+BP_W = 14            # coluna dos breakpoints
+GIT_W = 4            # barra de alteracoes do git
+BLAME_W = 190        # coluna do blame (quando ligada)
+GIT_COLORS = {"add": QColor(64, 200, 140), "mod": QColor(255, 179, 71), "del": QColor(255, 46, 64)}
 
 PAIRS = {"(": ")", "[": "]", "{": "}", '"': '"', "'": "'", "`": "`"}
 CLOSERS = {")", "]", "}"}
@@ -49,6 +62,7 @@ class Gutter(QWidget):
     def __init__(self, ed: "CodeEditor"):
         super().__init__(ed)
         self.ed = ed
+        self.setMouseTracking(True)
 
     def sizeHint(self):
         return QSize(self.ed.gutter_width(), 0)
@@ -56,11 +70,32 @@ class Gutter(QWidget):
     def paintEvent(self, e):
         self.ed.paint_gutter(e)
 
+    def _line_at(self, y: float) -> int:
+        c = self.ed.cursorForPosition(QPointF(0, y).toPoint())
+        return c.blockNumber()
+
     def mousePressEvent(self, e):
+        x, y = e.position().x(), e.position().y()
+        line = self._line_at(y)
+        if e.button() == Qt.RightButton:
+            self.ed.breakpoint_menu(line, e.globalPosition().toPoint())
+            return
+        bx = BLAME_W if self.ed.show_blame else 0
+        if bx <= x < bx + BP_W + 2:
+            self.ed.toggle_breakpoint(line)
+            return
         c = self.ed.cursorForPosition(e.position().toPoint())
         c.movePosition(QTextCursor.StartOfBlock)
         c.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
         self.ed.setTextCursor(c)
+
+    def mouseMoveEvent(self, e):
+        line = self._line_at(e.position().y())
+        tip = self.ed.gutter_tooltip(line, e.position().x())
+        if tip:
+            QToolTip.showText(e.globalPosition().toPoint(), tip, self)
+        else:
+            QToolTip.hideText()
 
 
 class CodeEditor(QPlainTextEdit):
@@ -69,6 +104,9 @@ class CodeEditor(QPlainTextEdit):
     hover_requested = Signal(int, int, object)       # linha, coluna, QPoint global
     definition_requested = Signal(int, int)
     completion_requested = Signal(int, int, str)     # linha, coluna, caractere gatilho
+    breakpoints_changed = Signal()
+    viewport_scrolled = Signal()
+    context_menu = Signal(object, int, int)          # QMenu, linha, coluna (a janela adiciona acoes)
 
     def __init__(self, path: Path | None = None, settings: dict | None = None):
         super().__init__()
@@ -81,6 +119,18 @@ class CodeEditor(QPlainTextEdit):
         self.diagnostics: list[dict] = []
         self.search_hits: list[QTextCursor] = []
         self.untitled_name = ""
+        # camadas visuais
+        self.inlay: list[dict] = []                     # [{line, col, label, kind}]
+        self.eol: dict[str, dict[int, str]] = {}        # camada -> {linha: texto no fim da linha}
+        self.breakpoints: list[dict] = []               # [{cursor, cond, log, enabled}]
+        self.debug_line = -1
+        self.git_changes: dict[int, str] = {}
+        self.blame: dict[int, dict] = {}
+        self.show_blame = False
+        self.conflicts: list[dict] = []
+        self.tpl_fields: list[tuple[int, QTextCursor, QTextCursor]] = []
+        self.tpl_index = -1
+        self.templates_user: dict = {}
         self.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.setFrameShape(QPlainTextEdit.NoFrame)
         self.set_font_size(int(self.settings.get("font_size", 14)))
@@ -129,6 +179,7 @@ class CodeEditor(QPlainTextEdit):
         self._complete_timer.setSingleShot(True)
         self._complete_timer.setInterval(180)
         self._complete_timer.timeout.connect(lambda: self.request_completion(""))
+        self.verticalScrollBar().valueChanged.connect(lambda _v: self.viewport_scrolled.emit())
         self._cursor_changed()
 
     # ------------------------------------------------------------ util
@@ -211,7 +262,8 @@ class CodeEditor(QPlainTextEdit):
     # ------------------------------------------------------------ gutter
     def gutter_width(self) -> int:
         digits = max(3, len(str(self.blockCount())))
-        return int(24 + QFontMetricsF(self.font()).horizontalAdvance("9") * digits)
+        return int(BP_W + 14 + GIT_W + QFontMetricsF(self.font()).horizontalAdvance("9") * digits +
+                   (BLAME_W if getattr(self, "show_blame", False) else 0))
 
     def _update_gutter_width(self, *_):
         self.setViewportMargins(self.gutter_width(), 0, 0, 0)
@@ -245,13 +297,66 @@ class CodeEditor(QPlainTextEdit):
         fh = self.fontMetrics().height()
         f = QFont(self.font())
         p.setFont(f)
+        p.setRenderHint(QPainter.Antialiasing)
+        bps = {self.bp_line(b): b for b in self.breakpoints}
+        gw = self.gutter.width()
+        bx = BLAME_W if self.show_blame else 0
+        small = QFont(self.font())
+        small.setPointSizeF(max(6.0, self.font().pointSizeF() * 0.78))
+        last_hash = None
         while block.isValid() and top <= e.rect().bottom():
             if block.isVisible() and bottom >= e.rect().top():
-                if num in diag_lines:
+                cy = top + fh / 2
+                if self.show_blame:
+                    info = self.blame.get(num)
+                    if info and info.get("hash") != last_hash:
+                        p.setFont(small)
+                        p.setPen(QColor(120, 120, 132))
+                        when = time.strftime("%d/%m/%y", time.localtime(info.get("time", 0)))
+                        txt = f"{when}  {info.get('author', '')[:16]}"
+                        if info.get("hash", "").startswith("0000000"):
+                            txt = "nao commitado"
+                        p.drawText(6, top, BLAME_W - 10, fh, Qt.AlignLeft | Qt.AlignVCenter, txt)
+                        p.setFont(f)
+                    last_hash = info.get("hash") if info else None
+                b = bps.get(num)
+                if b is not None:
+                    col = QColor(227, 18, 31) if b.get("enabled", True) else QColor(110, 40, 46)
+                    p.setPen(Qt.NoPen)
+                    p.setBrush(col)
+                    r = 5.0
+                    cx = bx + BP_W / 2 + 1
+                    if b.get("log"):
+                        p.drawPolygon(QPolygonF([QPointF(cx, cy - r), QPointF(cx + r, cy), QPointF(cx, cy + r),
+                                                 QPointF(cx - r, cy)]))
+                    else:
+                        p.drawEllipse(QPointF(cx, cy), r, r)
+                    if b.get("cond"):
+                        p.setBrush(QColor(255, 255, 255))
+                        p.drawEllipse(QPointF(cx, cy), 1.8, 1.8)
+                    p.setBrush(Qt.NoBrush)
+                if num == self.debug_line:
+                    p.setPen(Qt.NoPen)
+                    p.setBrush(QColor(255, 208, 80))
+                    p.drawPolygon(QPolygonF([QPointF(bx + 2, cy - 5), QPointF(bx + 9, cy - 5),
+                                             QPointF(bx + 13, cy), QPointF(bx + 9, cy + 5), QPointF(bx + 2, cy + 5)]))
+                    p.setBrush(Qt.NoBrush)
+                elif num in diag_lines and b is None:
                     col = QColor(255, 46, 64) if diag_lines[num] == 1 else QColor(255, 179, 71)
-                    p.fillRect(4, top + fh // 2 - 3, 6, 6, col)
+                    p.fillRect(QRectF(bx + 4, cy - 3, 6, 6), col)
+                gc = self.git_changes.get(num)
+                if gc:
+                    p.setPen(Qt.NoPen)
+                    if gc == "del":
+                        p.setBrush(GIT_COLORS["del"])
+                        p.drawPolygon(QPolygonF([QPointF(gw - GIT_W - 3, bottom - 4), QPointF(gw - 1, bottom),
+                                                 QPointF(gw - GIT_W - 3, bottom + 4)]))
+                        p.setBrush(Qt.NoBrush)
+                    else:
+                        p.fillRect(QRectF(gw - GIT_W - 2, top, GIT_W, bottom - top), GIT_COLORS[gc])
                 p.setPen(QColor(255, 46, 64) if num == cur else QColor(78, 78, 88))
-                p.drawText(0, top, self.gutter.width() - 10, fh, Qt.AlignRight | Qt.AlignVCenter, str(num + 1))
+                p.drawText(bx + BP_W, top, gw - bx - BP_W - GIT_W - 8, fh, Qt.AlignRight | Qt.AlignVCenter,
+                           str(num + 1))
             block = block.next()
             top = bottom
             bottom = top + round(self.blockBoundingRect(block).height())
@@ -272,6 +377,23 @@ class CodeEditor(QPlainTextEdit):
         cur.cursor = self.textCursor()
         cur.cursor.clearSelection()
         sels.append(cur)
+        if self.debug_line >= 0:
+            d = QTextEdit.ExtraSelection()
+            d.format.setBackground(QColor(255, 208, 80, 46))
+            d.format.setProperty(QTextFormat.FullWidthSelection, True)
+            d.cursor = self.cursor_at(self.debug_line, 0)
+            sels.append(d)
+        for blk in self.conflicts:
+            ours_end = blk["base"] if blk["base"] is not None else blk["mid"]
+            for a, b, col in ((blk["start"], ours_end, QColor(64, 200, 140, 34)),
+                              (blk["mid"], blk["end"], QColor(80, 140, 255, 34))):
+                for ln in range(a, b + 1):
+                    x = QTextEdit.ExtraSelection()
+                    x.format.setBackground(col if ln not in (blk["start"], blk["mid"], blk["end"], blk["base"])
+                                           else QColor(col.red(), col.green(), col.blue(), 90))
+                    x.format.setProperty(QTextFormat.FullWidthSelection, True)
+                    x.cursor = self.cursor_at(ln, 0)
+                    sels.append(x)
         for hit in self.search_hits:
             s = QTextEdit.ExtraSelection()
             s.format.setBackground(QColor(255, 179, 71, 70))
@@ -373,6 +495,17 @@ class CodeEditor(QPlainTextEdit):
             return
         if alt and key in (Qt.Key_Up, Qt.Key_Down):
             self.move_line(-1 if key == Qt.Key_Up else 1)
+            return
+        if key == Qt.Key_Escape and self.tpl_fields:
+            self.end_template()
+            return
+        if key == Qt.Key_Tab and not ctrl and self.tpl_fields:
+            self.next_field(1)
+            return
+        if key == Qt.Key_Backtab and self.tpl_fields:
+            self.next_field(-1)
+            return
+        if key == Qt.Key_Tab and not ctrl and not c.hasSelection() and self.try_template():
             return
         if key == Qt.Key_Tab and not ctrl:
             if c.hasSelection() and " " in c.selectedText():
@@ -625,6 +758,10 @@ class CodeEditor(QPlainTextEdit):
         prefix = self.word_prefix()
         if not items:
             items = self.word_items(prefix)
+        if prefix:
+            tp = [{"label": k, "insert": k, "detail": "template  ⇥ Tab", "kind": 15}
+                  for k in self.templates() if k.startswith(prefix)]
+            items = tp + list(items)
         self.model.clear()
         seen = set()
         for it in items[:400]:
@@ -666,14 +803,301 @@ class CodeEditor(QPlainTextEdit):
         idx = self.completer.popup().currentIndex()
         insert = idx.data(Qt.UserRole + 1) if idx.isValid() else text
         insert = insert or text
+        is_tpl = idx.isValid() and "template" in (idx.data() or "")
         prefix = self.word_prefix()
         c = self.textCursor()
         c.movePosition(QTextCursor.Left, QTextCursor.KeepAnchor, len(prefix))
         c.insertText(insert)
         self.setTextCursor(c)
         self.completer.popup().hide()
+        if is_tpl:
+            self.try_template()
+
+    # ------------------------------------------------------------ live templates
+    def templates(self) -> dict[str, str]:
+        return tpl.all_for(self.lang.id, self.templates_user)
+
+    def try_template(self) -> bool:
+        prefix = self.word_prefix()
+        body = self.templates().get(prefix) if prefix else None
+        if body is None:
+            return False
+        c = self.textCursor()
+        line = c.block().text()
+        indent = re.match(r"[ \t]*", line).group(0)
+        ctx = {"file": str(self.path or self.title()), "clipboard": QApplication.clipboard().text()[:2000]}
+        text, fields = tpl.expand(body, indent, self.indent_unit, ctx)
+        c.beginEditBlock()
+        c.movePosition(QTextCursor.Left, QTextCursor.KeepAnchor, len(prefix))
+        start = c.selectionStart()
+        c.insertText(text)
+        c.endEditBlock()
+        self.tpl_fields = []
+        for n, a, b in sorted(fields, key=lambda f: (f[0] == 0, f[0], f[1])):
+            ca = QTextCursor(self.document())
+            ca.setPosition(start + a)
+            ca.setKeepPositionOnInsert(True)
+            cb = QTextCursor(self.document())
+            cb.setPosition(start + b)
+            self.tpl_fields.append((n, ca, cb))
+        if not self.tpl_fields:
+            return True
+        self.tpl_index = -1
+        self.next_field(1)
+        return True
+
+    def _field_order(self) -> list[int]:
+        seen, order = set(), []
+        for i, (n, _a, _b) in enumerate(self.tpl_fields):
+            if n not in seen:
+                seen.add(n)
+                order.append(i)
+        return order
+
+    def next_field(self, d: int):
+        order = self._field_order()
+        if self.tpl_index >= 0:
+            n, a, b = self.tpl_fields[self.tpl_index]
+            cur = self.document().toPlainText()[a.position():b.position()]
+            for n2, a2, b2 in self.tpl_fields:      # espelha campos com o mesmo numero
+                if n2 == n and a2 is not a:
+                    cc = QTextCursor(self.document())
+                    cc.setPosition(a2.position())
+                    cc.setPosition(b2.position(), QTextCursor.KeepAnchor)
+                    if cc.selectedText() != cur:
+                        cc.insertText(cur)
+        pos = order.index(self.tpl_index) if self.tpl_index in order else -1
+        pos = max(0, pos + d)
+        if pos >= len(order):
+            return self.end_template()
+        self.tpl_index = order[pos]
+        n, a, b = self.tpl_fields[self.tpl_index]
+        c = QTextCursor(self.document())
+        c.setPosition(a.position())
+        c.setPosition(b.position(), QTextCursor.KeepAnchor)
+        self.setTextCursor(c)
+        if n == 0:
+            self.end_template(keep_cursor=True)
+        self.viewport().update()
+
+    def end_template(self, keep_cursor=False):
+        if not keep_cursor and self.tpl_fields:
+            zero = [f for f in self.tpl_fields if f[0] == 0]
+            if zero:
+                c = QTextCursor(self.document())
+                c.setPosition(zero[0][1].position())
+                self.setTextCursor(c)
+        self.tpl_fields = []
+        self.tpl_index = -1
+        self.viewport().update()
+
+
+    # ------------------------------------------------------------ breakpoints
+    def bp_line(self, b: dict) -> int:
+        return b["cursor"].blockNumber()
+
+    def breakpoint_at(self, line: int) -> dict | None:
+        return next((b for b in self.breakpoints if self.bp_line(b) == line), None)
+
+    def toggle_breakpoint(self, line: int | None = None):
+        line = self.textCursor().blockNumber() if line is None else line
+        b = self.breakpoint_at(line)
+        if b:
+            self.breakpoints.remove(b)
+        else:
+            self.breakpoints.append({"cursor": QTextCursor(self.document().findBlockByNumber(line)),
+                                     "cond": "", "log": "", "enabled": True})
+        self.gutter.update()
+        self.breakpoints_changed.emit()
+
+    def set_breakpoint(self, line: int, cond: str = "", log: str = ""):
+        b = self.breakpoint_at(line)
+        if not b:
+            b = {"cursor": QTextCursor(self.document().findBlockByNumber(line)), "enabled": True}
+            self.breakpoints.append(b)
+        b["cond"], b["log"] = cond, log
+        self.gutter.update()
+        self.breakpoints_changed.emit()
+
+    def breakpoint_menu(self, line: int, gpos):
+        from PySide6.QtWidgets import QInputDialog
+        m = QMenu(self)
+        b = self.breakpoint_at(line)
+        m.addAction("Remover breakpoint" if b else "Adicionar breakpoint", lambda: self.toggle_breakpoint(line))
+
+        def cond():
+            t, ok = QInputDialog.getText(self, "Breakpoint condicional",
+                                         "Pausar so quando esta expressao for verdadeira (ex.: x > 500):",
+                                         text=(b or {}).get("cond", ""))
+            if ok:
+                self.set_breakpoint(line, t.strip(), (b or {}).get("log", ""))
+
+        def log():
+            t, ok = QInputDialog.getText(self, "Logpoint (nao pausa)",
+                                         "Mensagem para registrar; use {expressao} para valores (ex.: i={i}):",
+                                         text=(b or {}).get("log", ""))
+            if ok:
+                self.set_breakpoint(line, (b or {}).get("cond", ""), t.strip())
+        m.addAction("Condicao...", cond)
+        m.addAction("Registrar mensagem sem pausar (logpoint)...", log)
+        if b:
+            def flip():
+                b["enabled"] = not b.get("enabled", True)
+                self.gutter.update()
+                self.breakpoints_changed.emit()
+            m.addAction("Desativar" if b.get("enabled", True) else "Ativar", flip)
+        m.addSeparator()
+        m.addAction("Ocultar git blame" if self.show_blame else "Mostrar git blame", self.toggle_blame)
+        m.exec(gpos)
+
+    def toggle_blame(self):
+        self.show_blame = not self.show_blame
+        self._update_gutter_width()
+        cr = self.contentsRect()
+        self.gutter.setGeometry(QRect(cr.left(), cr.top(), self.gutter_width(), cr.height()))
+        self.gutter.update()
+
+    def gutter_tooltip(self, line: int, x: float) -> str:
+        parts = []
+        b = self.breakpoint_at(line)
+        if b:
+            parts.append("BREAKPOINT" + (f"  se {b['cond']}" if b.get("cond") else "") +
+                         (f"\nlog: {b['log']}" if b.get("log") else ""))
+        info = self.blame.get(line)
+        near_git = x > self.gutter.width() - GIT_W - 8
+        if info and (self.show_blame and x < BLAME_W or near_git):
+            when = time.strftime("%d/%m/%Y %H:%M", time.localtime(info.get("time", 0)))
+            parts.append(f"{info.get('hash', '')[:8]}  {info.get('author', '')}  {when}\n{info.get('summary', '')}")
+        gc = self.git_changes.get(line)
+        if gc and near_git:
+            parts.append({"add": "linha nova (desde o ultimo commit)", "mod": "linha alterada",
+                          "del": "linhas removidas aqui"}[gc])
+        return "\n\n".join(parts)
+
+    def set_debug_line(self, line: int):
+        self.debug_line = line
+        self.update_extra()
+        self.gutter.update()
+
+    # ------------------------------------------------------------ inlay hints e textos no fim da linha
+    def hint_font(self) -> QFont:
+        f = QFont(self.font())
+        f.setPointSizeF(max(6.0, self.font().pointSizeF() * 0.82))
+        return f
+
+    def set_inlay_hints(self, hints: list[dict]):
+        """Hints inline: o highlighter abre espaco antes da coluna e o paintEvent desenha o rotulo."""
+        fm = QFontMetricsF(self.hint_font())
+        by_line: dict[int, list] = {}
+        clean = []
+        doc = self.document()
+        for h in hints:
+            b = doc.findBlockByNumber(h["line"])
+            if not b.isValid() or h["col"] <= 0 or h["col"] > len(b.text()):
+                continue
+            h = dict(h, width=round(fm.horizontalAdvance(h["label"]) + 10))
+            clean.append(h)
+            by_line.setdefault(h["line"], []).append((h["col"], h["width"]))
+        old = self.highlighter.hints
+        new = {ln: (doc.findBlockByNumber(ln).text(), sorted(v)) for ln, v in by_line.items()}
+        self.inlay = clean
+        if old != new:
+            self.highlighter.hints = new
+            for ln in set(old) | set(new):
+                if old.get(ln) != new.get(ln):
+                    b = doc.findBlockByNumber(ln)
+                    if b.isValid():
+                        self.highlighter.rehighlightBlock(b)
+        self.viewport().update()
+
+    def set_eol(self, layer: str, data: dict[int, str]):
+        if data:
+            self.eol[layer] = data
+        else:
+            self.eol.pop(layer, None)
+        self.viewport().update()
+
+    def visible_lines(self) -> tuple[int, int]:
+        first = self.firstVisibleBlock().blockNumber()
+        last = self.cursorForPosition(self.viewport().rect().bottomLeft()).blockNumber()
+        return first, max(first, last)
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        if not (self.inlay or self.eol or self.tpl_fields):
+            return
+        p = QPainter(self.viewport())
+        p.setRenderHint(QPainter.Antialiasing)
+        hf = self.hint_font()
+        p.setFont(hf)
+        hfm = QFontMetricsF(hf)
+        first, last = self.visible_lines()
+        doc = self.document()
+        hints = self.highlighter.hints
+        for h in self.inlay:
+            if not (first <= h["line"] <= last):
+                continue
+            snap = hints.get(h["line"])
+            if not snap or snap[0] != doc.findBlockByNumber(h["line"]).text():
+                continue
+            r = self.cursorRect(self.cursor_at(h["line"], h["col"]))
+            box = QRectF(r.left() - h["width"] + 3, r.top() + 2, h["width"] - 6, r.height() - 4)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(255, 255, 255, 16))
+            p.drawRoundedRect(box, 3, 3)
+            p.setPen(QColor(128, 134, 156) if h.get("kind") == 2 else QColor(112, 160, 150))
+            p.drawText(box, Qt.AlignCenter, h["label"])
+        if self.eol:
+            colors = {"debug": QColor(255, 208, 80), "usages": QColor(110, 110, 124), "blame": QColor(92, 92, 104)}
+            cur_line = self.textCursor().blockNumber()
+            for ln in range(first, last + 1):
+                texts = []
+                for layer in ("debug", "usages", "blame"):
+                    t = self.eol.get(layer, {}).get(ln)
+                    if t and (layer != "blame" or ln == cur_line):
+                        texts.append((layer, t))
+                if not texts:
+                    continue
+                b = doc.findBlockByNumber(ln)
+                r = self.cursorRect(self.cursor_at(ln, len(b.text())))
+                x = r.right() + 28
+                for layer, t in texts:
+                    t = t[:160]
+                    if layer == "debug":
+                        w = hfm.horizontalAdvance(t) + 12
+                        p.setPen(Qt.NoPen)
+                        p.setBrush(QColor(255, 208, 80, 28))
+                        p.drawRoundedRect(QRectF(x - 6, r.top() + 2, w, r.height() - 4), 3, 3)
+                    p.setPen(colors.get(layer, QColor(110, 110, 124)))
+                    p.drawText(QPointF(x, r.top() + (r.height() + hfm.ascent() - hfm.descent()) / 2), t)
+                    x += hfm.horizontalAdvance(t) + 24
+        if self.tpl_fields:
+            p.setBrush(Qt.NoBrush)
+            for i, (n, a, b) in enumerate(self.tpl_fields):
+                ra = self.cursorRect(self._cur(a.position()))
+                rb = self.cursorRect(self._cur(b.position()))
+                if ra.top() != rb.top():
+                    continue
+                p.setPen(QColor(227, 18, 31) if i == self.tpl_index else QColor(227, 18, 31, 90))
+                p.drawRect(QRectF(ra.left() - 1, ra.top(), max(4, rb.left() - ra.left() + 2), ra.height() - 1))
+        p.end()
+
+    def _cur(self, pos: int) -> QTextCursor:
+        c = QTextCursor(self.document())
+        c.setPosition(max(0, min(pos, self.document().characterCount() - 1)))
+        return c
+
+    def contextMenuEvent(self, e):
+        m = self.createStandardContextMenu()
+        c = self.cursorForPosition(e.pos())
+        if not self.textCursor().hasSelection():
+            self.setTextCursor(c)
+        m.addSeparator()
+        self.context_menu.emit(m, c.blockNumber(), c.positionInBlock())
+        m.exec(e.globalPos())
 
     # ------------------------------------------------------------ mouse: hover e Ctrl+clique
+
     def mouseMoveEvent(self, e):
         super().mouseMoveEvent(e)
         self._hover_pos = e.position().toPoint()
